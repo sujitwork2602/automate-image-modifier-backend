@@ -8,7 +8,7 @@ import base64
 
 app = Flask(__name__)
 
-CORS(app, origins=["https://ai-image-modifier.web.app/"])
+CORS(app, origins=["https://ai-image-modifier.web.app"])
 
 # Set your OpenAI key from environment variable
 openai.api_key = os.getenv("OPENAI_API_KEY")
