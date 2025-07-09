@@ -9,7 +9,7 @@ from flask_cors import CORS
 
 # === Flask Setup ===
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # CORS FIX
+CORS(app, resources={r"/*": {"origins": ["https://ai-image-modifier.web.app"]}})  # CORS FIX
 
 # === Load Secrets ===
 load_dotenv()
