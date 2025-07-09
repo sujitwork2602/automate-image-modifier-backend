@@ -1,43 +1,106 @@
 import os
 import base64
 import openai
-import requests
+from PIL import Image
+import io
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# === Setup ===
 app = Flask(__name__)
 CORS(app, origins=["https://ai-image-modifier.web.app"])
 
 load_dotenv()
-
-# Initialize OpenAI client
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# === Utilities ===
-def encode_image_to_base64(image_bytes):
-    return base64.b64encode(image_bytes).decode("utf-8")
-
-# === Routes ===
-@app.route("/generate", methods=["POST"])
-def generate():
+def prepare_image_for_edit(image_bytes):
+    """Prepare image for OpenAI edit API - must be square PNG with transparency"""
     try:
-        print("➡️ Request received")
+        # Open the image
+        image = Image.open(io.BytesIO(image_bytes))
+        
+        # Convert to RGBA if not already
+        if image.mode != 'RGBA':
+            image = image.convert('RGBA')
+        
+        # Make it square by cropping or padding
+        width, height = image.size
+        size = min(width, height)
+        
+        # Crop to square from center
+        left = (width - size) // 2
+        top = (height - size) // 2
+        right = left + size
+        bottom = top + size
+        
+        square_image = image.crop((left, top, right, bottom))
+        
+        # Resize to 1024x1024 (required by OpenAI)
+        square_image = square_image.resize((1024, 1024), Image.Resampling.LANCZOS)
+        
+        # Convert to bytes
+        img_byte_arr = io.BytesIO()
+        square_image.save(img_byte_arr, format='PNG')
+        img_byte_arr.seek(0)
+        
+        return img_byte_arr
+        
+    except Exception as e:
+        raise Exception(f"Image preparation failed: {str(e)}")
+
+def create_edit_mask(image_bytes, mask_prompt):
+    """Create a mask for the areas to edit using GPT-4o analysis"""
+    try:
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        
+        mask_analysis = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert at identifying specific areas in images that need to be edited. Provide precise instructions for creating an edit mask."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"Analyze this image and identify the specific areas that should be modified for this request: '{mask_prompt}'. Describe exactly which parts of the image need to be changed."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=300
+        )
+        
+        return mask_analysis.choices[0].message.content.strip()
+        
+    except Exception as e:
+        raise Exception(f"Mask analysis failed: {str(e)}")
+
+@app.route("/edit-image", methods=["POST"])
+def edit_image():
+    """Use OpenAI's image edit API for more accurate modifications"""
+    try:
+        print("➡️ Edit request received")
 
         if not os.getenv("OPENAI_API_KEY"):
-            print("❌ OpenAI API key not found")
             return jsonify({"error": "OpenAI API key not configured"}), 500
 
         if 'image' not in request.files or 'prompt' not in request.form:
-            print("❌ Missing 'image' or 'prompt'")
             return jsonify({"error": "Missing image or prompt"}), 400
 
         image_file = request.files['image']
-        prompt = request.form['prompt'].strip()
+        edit_prompt = request.form['prompt'].strip()
 
-        if not prompt:
-            return jsonify({"error": "Prompt cannot be empty"}), 400
+        if not edit_prompt:
+            return jsonify({"error": "Edit prompt cannot be empty"}), 400
 
         if image_file.filename == '':
             return jsonify({"error": "No image file selected"}), 400
@@ -46,32 +109,128 @@ def generate():
         if not image_bytes:
             return jsonify({"error": "Empty image file"}), 400
 
-        base64_image = encode_image_to_base64(image_bytes)
-
-        print("🔍 Using GPT-4o to analyze and describe the image...")
+        print("🔧 Preparing image for editing...")
         try:
-            # Better prompt for image analysis
-            analysis_prompt = f"""
-            Analyze this image in detail and create a comprehensive description that captures:
-            1. The main subject(s) and their appearance
-            2. The setting/background
-            3. Colors, lighting, and mood
-            4. Style and artistic elements
-            5. Any text or objects present
+            prepared_image = prepare_image_for_edit(image_bytes)
+        except Exception as e:
+            print(f"❌ Image preparation error: {str(e)}")
+            return jsonify({"error": "Failed to prepare image", "details": str(e)}), 500
+
+        print("✏️ Generating edited image...")
+        try:
+            # Use OpenAI's image edit API
+            response = client.images.edit(
+                image=prepared_image,
+                prompt=edit_prompt,
+                n=1,
+                size="1024x1024"
+            )
             
-            Then, based on this analysis, create a detailed DALL-E 3 prompt that would recreate this image but with this modification: {prompt}
+            edited_image_url = response.data[0].url
+            print("✅ Image edited successfully")
             
-            Make sure the prompt preserves the original image's key characteristics while incorporating the requested change.
+            return jsonify({
+                "image_url": edited_image_url,
+                "edit_prompt": edit_prompt,
+                "method": "OpenAI Edit API"
+            })
             
-            Format your response as:
-            ANALYSIS: [detailed description of the original image]
+        except Exception as e:
+            print(f"❌ Edit API error: {str(e)}")
+            error_msg = str(e)
             
-            DALL-E PROMPT: [modified prompt for DALL-E 3]
-            """
-            
+            if "429" in error_msg:
+                return jsonify({
+                    "error": "Rate limit exceeded", 
+                    "message": "Too many edit requests. Please wait before trying again.",
+                    "details": str(e)
+                }), 429
+            else:
+                return jsonify({"error": "Failed to edit image", "details": str(e)}), 500
+
+    except Exception as e:
+        print(f"💥 Server error: {str(e)}")
+        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+
+@app.route("/generate-variation", methods=["POST"])
+def generate_variation():
+    """Use OpenAI's image variation API"""
+    try:
+        print("➡️ Variation request received")
+
+        if 'image' not in request.files:
+            return jsonify({"error": "Missing image"}), 400
+
+        image_file = request.files['image']
+        image_bytes = image_file.read()
+        
+        prepared_image = prepare_image_for_edit(image_bytes)
+        
+        print("🔄 Generating variation...")
+        response = client.images.create_variation(
+            image=prepared_image,
+            n=1,
+            size="1024x1024"
+        )
+        
+        variation_url = response.data[0].url
+        print("✅ Variation generated successfully")
+        
+        return jsonify({
+            "image_url": variation_url,
+            "method": "OpenAI Variation API"
+        })
+        
+    except Exception as e:
+        print(f"❌ Variation error: {str(e)}")
+        return jsonify({"error": "Failed to generate variation", "details": str(e)}), 500
+
+@app.route("/generate-smart", methods=["POST"])
+def generate_smart():
+    """Improved DALL-E generation with better context preservation"""
+    try:
+        print("➡️ Smart generation request received")
+
+        if 'image' not in request.files or 'prompt' not in request.form:
+            return jsonify({"error": "Missing image or prompt"}), 400
+
+        image_file = request.files['image']
+        modification_request = request.form['prompt'].strip()
+        
+        image_bytes = image_file.read()
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+
+        # Get a very detailed analysis focusing on preservation
+        print("🔍 Analyzing image for context preservation...")
+        analysis_prompt = f"""
+        CRITICAL: Your job is to create a DALL-E prompt that will produce an image as identical as possible to the uploaded image, with ONLY the specific change requested.
+
+        1. Analyze every detail of this image:
+           - Exact clothing, colors, textures, patterns
+           - Precise facial features, hair, expressions
+           - Exact background elements, lighting, shadows
+           - Camera angle, composition, framing
+           - Artistic style, photo quality, filters
+
+        2. Create a DALL-E prompt that:
+           - Recreates EVERY visual element exactly
+           - Only incorporates this change: "{modification_request}"
+           - Uses specific descriptive terms, not generic ones
+           - Maintains the exact same style and quality
+
+        3. Be extremely specific about details that should NOT change.
+
+        Respond with only the DALL-E prompt, nothing else.
+        """
+
+        try:
             gpt_response = client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert at creating DALL-E prompts that preserve original image details while making minimal specific changes. Focus on exact replication with precise modifications."
+                    },
                     {
                         "role": "user",
                         "content": [
@@ -88,109 +247,51 @@ def generate():
                         ]
                     }
                 ],
-                max_tokens=800
+                max_tokens=800,
+                temperature=0.1  # Very low temperature for consistency
             )
         except Exception as e:
-            print(f"❌ GPT-4o API error: {str(e)}")
             return jsonify({"error": "Failed to analyze image", "details": str(e)}), 500
 
-        response_text = gpt_response.choices[0].message.content.strip()
-        print("📝 GPT-4o Response:", response_text)
+        dalle_prompt = gpt_response.choices[0].message.content.strip()
+        print("🎨 Generated preservation-focused prompt")
 
-        # Extract the DALL-E prompt from the response
-        if "DALL-E PROMPT:" in response_text:
-            dalle_prompt = response_text.split("DALL-E PROMPT:")[-1].strip()
-        else:
-            # Fallback if format is not followed
-            dalle_prompt = response_text
-
-        print("🎨 Final DALL-E Prompt:", dalle_prompt)
-
-        print("🖼️ Calling DALL·E 3 to generate modified image...")
+        print("🖼️ Generating with DALL-E 3...")
         try:
             dalle_response = client.images.generate(
                 model="dall-e-3",
                 prompt=dalle_prompt,
                 size="1024x1024",
-                quality="standard",
+                quality="hd",  # Use HD quality for better detail preservation
                 n=1
             )
         except Exception as e:
-            print(f"❌ DALL·E API error: {str(e)}")
             error_msg = str(e)
-            
             if "429" in error_msg:
                 return jsonify({
                     "error": "Rate limit exceeded", 
-                    "message": "You've reached the maximum number of image generations allowed. Please wait before trying again.",
-                    "details": str(e)
+                    "message": "Too many requests. Please wait before trying again."
                 }), 429
-            elif "insufficient_quota" in error_msg:
-                return jsonify({
-                    "error": "Insufficient credits", 
-                    "message": "Your OpenAI account has insufficient credits. Please add credits to continue.",
-                    "details": str(e)
-                }), 402
             else:
                 return jsonify({"error": "Failed to generate image", "details": str(e)}), 500
 
         image_url = dalle_response.data[0].url
-        print("✅ Image generated:", image_url)
+        print("✅ Smart generation complete")
 
         return jsonify({
             "image_url": image_url,
-            "analysis": response_text.split("DALL-E PROMPT:")[0].replace("ANALYSIS:", "").strip() if "ANALYSIS:" in response_text else "Analysis not available",
-            "prompt_used": dalle_prompt
+            "prompt_used": dalle_prompt,
+            "method": "Smart DALL-E Generation"
         })
 
     except Exception as e:
         print(f"💥 Server error: {str(e)}")
         return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
 
-@app.route("/analyze-only", methods=["POST"])
-def analyze_only():
-    """Endpoint to just analyze the image without generating a new one"""
-    try:
-        if 'image' not in request.files:
-            return jsonify({"error": "Missing image"}), 400
-
-        image_file = request.files['image']
-        image_bytes = image_file.read()
-        base64_image = encode_image_to_base64(image_bytes)
-
-        gpt_response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Analyze this image in detail. Describe what you see including subjects, setting, colors, style, and any notable elements."
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }
-                        }
-                    ]
-                }
-            ],
-            max_tokens=500
-        )
-
-        analysis = gpt_response.choices[0].message.content.strip()
-        return jsonify({"analysis": analysis})
-
-    except Exception as e:
-        return jsonify({"error": "Analysis failed", "details": str(e)}), 500
-
 @app.route("/health", methods=["GET"])
 def health_check():
-    return jsonify({"status": "healthy", "message": "API is running"})
+    return jsonify({"status": "healthy", "message": "Image Editor API is running"})
 
-# === Main entry ===
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))
     app.run(host="0.0.0.0", port=port, debug=True)
