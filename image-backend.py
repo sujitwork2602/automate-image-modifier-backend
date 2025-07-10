@@ -8,11 +8,10 @@ import openai
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")           # make sure .env is set
-ALLOWED_ORIGINS = ["https://ai-image-modifier.web.app"]  # frontend origin
 
 # ── FLASK APP & CORS ────────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
+CORS(app, resources={r"/*": {"origins": ["https://ai-image-modifier.web.app"]}})
 
 # ── UTILITIES ───────────────────────────────────────────────────────────────
 def to_square_rgba(img: Image.Image, size: int = 1024) -> Image.Image:
