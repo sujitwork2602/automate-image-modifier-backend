@@ -37,17 +37,11 @@ def edit_image():
         mask_file = request.files.get("mask")
         prompt    = request.form.get("prompt", "").strip()
 
-        if not image_file:
-            return jsonify({"error": "Missing 'image' in form-data"}), 400
-
-        if not prompt:
-            return jsonify({"error": "Missing 'prompt' in form-data"}), 400
-
-        if image_file.filename == "":
-            return jsonify({"error": "Image file name is empty"}), 400
-
-        if image_file.content_length == 0:
-            return jsonify({"error": "Image file is empty"}), 400
+        if not (img_file and mask_file and prompt):
+            return (
+                jsonify({"error": "Require image, mask, and prompt fields."}),
+                400,
+            )
 
         # 2. Prepare image & mask --------------------------------------------
         img_raw  = Image.open(img_file.stream)
